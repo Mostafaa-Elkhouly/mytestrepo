@@ -13,5 +13,5 @@ jobs:
         run: echo "Hello, world"
       - name: print goodbye msg
         run: |
-            echo "First output",
+            echo "First output"
             echo "Second output"
