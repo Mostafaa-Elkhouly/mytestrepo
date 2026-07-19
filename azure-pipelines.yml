@@ -1,0 +1,96 @@
+# --------------------------------------------------------------------------------
+# Azure DevOps Pipeline: Provision Azure Virtual Machine
+# Triggered dynamically by Backstage Scaffolder
+# --------------------------------------------------------------------------------
+
+trigger: none # Disable automatic git pushes; Backstage triggers this via API
+
+# 1. Accept parameters injected by Backstage's 'templateParameters' block
+parameters:
+  - name: vmName
+    type: string
+    default: 'dev-vm-01'
+  - name: location
+    type: string
+    default: 'westeurope'
+  - name: vmSize
+    type: string
+    default: 'Standard_B2s'
+  - name: osImage
+    type: string
+    default: 'ubuntu-2204'
+  - name: adminUsername
+    type: string
+    default: 'azureadmin'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Your existing Azure Service Connection name from your previous pipeline
+  azureServiceConnection: 'Visual Studio Enterprise Subscription(15ec917d-2164-4d61-9fb2-243e7e5dad56)'
+  resourceGroupName: 'rg-backstage-vms-${{ parameters.location }}'
+
+stages:
+  - stage: ProvisionVM
+    displayName: 'Provision Virtual Machine Infrastructure'
+    jobs:
+      - job: DeployVM
+        displayName: 'Create Resource Group and VM'
+        steps:
+          # Step 1: Create or Verify the Target Resource Group
+          - task: AzureCLI@2
+            displayName: 'Create Resource Group ($(resourceGroupName))'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Creating resource group $(resourceGroupName) in ${{ parameters.location }}..."
+                az group create --name $(resourceGroupName) --location ${{ parameters.location }}
+
+          # Step 2: Provision the Virtual Machine using Azure CLI
+          # (If you prefer running your Terraform files instead, replace this task with Terraform commands)
+          - task: AzureCLI@2
+            displayName: 'Provision Azure VM (${{ parameters.vmName }})'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Map Backstage OS parameter strings to Azure Image URNs
+                IMAGE="${{ parameters.osImage }}"
+                if [ "$IMAGE" == "ubuntu-2204" ]; then
+                  AZ_IMAGE="Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest"
+                elif [ "$IMAGE" == "ubuntu-2004" ]; then
+                  AZ_IMAGE="Canonical:0001-com-ubuntu-server-focal:20_04-lts:latest"
+                elif [ "$IMAGE" == "windows-2022" ]; then
+                  AZ_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
+                elif [ "$IMAGE" == "windows-2019" ]; then
+                  AZ_IMAGE="MicrosoftWindowsServer:WindowsServer:2019-Datacenter:latest"
+                else
+                  AZ_IMAGE="Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest"
+                fi
+
+                echo "Deploying VM ${{ parameters.vmName }} using image $AZ_IMAGE..."
+
+                # Execute VM creation (Generates SSH keys automatically for Linux VMs)
+                az vm create \
+                  --resource-group $(resourceGroupName) \
+                  --name "${{ parameters.vmName }}" \
+                  --image "$AZ_IMAGE" \
+                  --size "${{ parameters.vmSize }}" \
+                  --admin-username "${{ parameters.adminUsername }}" \
+                  --generate-ssh-keys \
+                  --public-ip-sku Standard
+
+          # Step 3: Print summary output in build logs
+          - script: |
+              echo "===================================================="
+              echo "🎉 VM Provisioning Successfully Executed!"
+              echo "VM Name:   ${{ parameters.vmName }}"
+              echo "Region:    ${{ parameters.location }}"
+              echo "Size:      ${{ parameters.vmSize }}"
+              echo "OS Image:  ${{ parameters.osImage }}"
+              echo "===================================================="
+            displayName: 'Deployment Summary'
