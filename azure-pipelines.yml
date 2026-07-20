@@ -34,22 +34,24 @@ variables:
   resourceGroupName: "rg-backstage-vms-${{ parameters.location }}"
 
 stages:
+
 - stage: ProvisionVM
-  displayName: Provision Virtual Machine
+  displayName: Provision Virtual Machine Infrastructure
 
   jobs:
+
   - job: DeployVM
-    displayName: Deploy Azure VM
+    displayName: Create Resource Group and VM
 
     steps:
 
-    #----------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Create Resource Group
-    #----------------------------------------------------------
+    # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: Create Resource Group
+      displayName: "Create Resource Group"
       inputs:
-        azureSubscription: $(azureServiceConnection)
+        azureSubscription: "$(azureServiceConnection)"
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
@@ -58,27 +60,27 @@ stages:
 
           echo "Checking Resource Group..."
 
-          if az group exists --name $(resourceGroupName); then
+          if az group exists --name "$(resourceGroupName)"; then
             echo "Resource Group already exists."
           else
             echo "Creating Resource Group..."
             az group create \
-              --name $(resourceGroupName) \
+              --name "$(resourceGroupName)" \
               --location "${{ parameters.location }}"
           fi
 
-    #----------------------------------------------------------
-    # Create VM
-    #----------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Provision VM
+    # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: Provision Azure VM
+      displayName: "Provision Azure VM"
       inputs:
-        azureSubscription: $(azureServiceConnection)
+        azureSubscription: "$(azureServiceConnection)"
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
 
-          set -euo pipefail
+          set -uo pipefail
 
           case "${{ parameters.osImage }}" in
             ubuntu-2204)
@@ -99,46 +101,114 @@ stages:
               ;;
           esac
 
-          echo "======================================"
+          echo "=========================================="
           echo "VM Name      : ${{ parameters.vmName }}"
           echo "Location     : ${{ parameters.location }}"
-          echo "Size         : ${{ parameters.vmSize }}"
+          echo "VM Size      : ${{ parameters.vmSize }}"
           echo "Admin User   : ${{ parameters.adminUsername }}"
           echo "Image        : $AZ_IMAGE"
-          echo "======================================"
+          echo "=========================================="
 
           az vm create \
-            --resource-group $(resourceGroupName) \
+            --resource-group "$(resourceGroupName)" \
             --name "${{ parameters.vmName }}" \
             --image "$AZ_IMAGE" \
             --size "${{ parameters.vmSize }}" \
             --admin-username "${{ parameters.adminUsername }}" \
             --generate-ssh-keys \
             --public-ip-sku Standard \
-            --output table \
-            --verbose
+            --output json \
+            --debug
 
-    #----------------------------------------------------------
+          EXIT_CODE=$?
+
+          if [ $EXIT_CODE -ne 0 ]; then
+
+            echo ""
+            echo "=================================================="
+            echo "VM creation failed."
+            echo "Collecting deployment diagnostics..."
+            echo "=================================================="
+
+            echo ""
+            echo "Deployments:"
+            az deployment group list \
+              --resource-group "$(resourceGroupName)" \
+              --query "[].{Name:name,State:properties.provisioningState,Timestamp:properties.timestamp}" \
+              -o table || true
+
+            DEPLOYMENT_NAME=$(az deployment group list \
+              --resource-group "$(resourceGroupName)" \
+              --query "[0].name" \
+              -o tsv 2>/dev/null)
+
+            if [ -n "$DEPLOYMENT_NAME" ]; then
+
+              echo ""
+              echo "Latest deployment:"
+              echo "$DEPLOYMENT_NAME"
+
+              echo ""
+              echo "Deployment Details:"
+              az deployment group show \
+                --resource-group "$(resourceGroupName)" \
+                --name "$DEPLOYMENT_NAME" \
+                -o json || true
+
+              echo ""
+              echo "Deployment Operations:"
+              az deployment operation group list \
+                --resource-group "$(resourceGroupName)" \
+                --name "$DEPLOYMENT_NAME" \
+                -o table || true
+            fi
+
+            exit $EXIT_CODE
+          fi
+
+          echo ""
+          echo "VM created successfully."
+
+    # --------------------------------------------------------------------------
     # Show VM Details
-    #----------------------------------------------------------
+    # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: Show VM Details
+      displayName: "Show VM Details"
       condition: succeeded()
       inputs:
-        azureSubscription: $(azureServiceConnection)
+        azureSubscription: "$(azureServiceConnection)"
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
 
           az vm show \
-            --resource-group $(resourceGroupName) \
+            --resource-group "$(resourceGroupName)" \
             --name "${{ parameters.vmName }}" \
             --show-details \
             --output table
 
-    #----------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Activity Log (runs only if deployment fails)
+    # --------------------------------------------------------------------------
+    - task: AzureCLI@2
+      displayName: "Show Activity Log"
+      condition: failed()
+      inputs:
+        azureSubscription: "$(azureServiceConnection)"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          echo "========== Recent Activity Log =========="
+
+          az monitor activity-log list \
+            --resource-group "$(resourceGroupName)" \
+            --max-events 20 \
+            -o table || true
+
+    # --------------------------------------------------------------------------
     # Summary
-    #----------------------------------------------------------
+    # --------------------------------------------------------------------------
     - script: |
         echo "======================================"
         echo "VM Provisioning Completed Successfully"
@@ -147,4 +217,4 @@ stages:
         echo "Size    : ${{ parameters.vmSize }}"
         echo "Image   : ${{ parameters.osImage }}"
         echo "======================================"
-      displayName: Deployment Summary
+      displayName: "Deployment Summary"
