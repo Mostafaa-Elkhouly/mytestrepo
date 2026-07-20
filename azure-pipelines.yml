@@ -41,7 +41,7 @@ stages:
   jobs:
 
   - job: DeployVM
-    displayName: Create Resource Group and VM
+    displayName: Deploy Azure VM
 
     steps:
 
@@ -49,16 +49,14 @@ stages:
     # Create Resource Group
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: "Create Resource Group"
+      displayName: Create Resource Group
       inputs:
-        azureSubscription: "$(azureServiceConnection)"
+        azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
 
           set -euo pipefail
-
-          echo "Checking Resource Group..."
 
           if az group exists --name "$(resourceGroupName)"; then
             echo "Resource Group already exists."
@@ -73,14 +71,14 @@ stages:
     # Provision VM
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: "Provision Azure VM"
+      displayName: Provision Azure VM
       inputs:
-        azureSubscription: "$(azureServiceConnection)"
+        azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
 
-          set -uo pipefail
+          set +e
 
           case "${{ parameters.osImage }}" in
             ubuntu-2204)
@@ -96,18 +94,50 @@ stages:
               AZ_IMAGE="MicrosoftWindowsServer:WindowsServer:2019-Datacenter:latest"
               ;;
             *)
-              echo "Unsupported image: ${{ parameters.osImage }}"
+              echo "Unsupported image."
               exit 1
               ;;
           esac
 
-          echo "=========================================="
-          echo "VM Name      : ${{ parameters.vmName }}"
-          echo "Location     : ${{ parameters.location }}"
-          echo "VM Size      : ${{ parameters.vmSize }}"
-          echo "Admin User   : ${{ parameters.adminUsername }}"
-          echo "Image        : $AZ_IMAGE"
-          echo "=========================================="
+          echo "========================================"
+          echo "Azure Account"
+          echo "========================================"
+
+          az account show -o table
+
+          echo ""
+          echo "========================================"
+          echo "Resource Group"
+          echo "========================================"
+
+          az group show \
+            --name "$(resourceGroupName)" \
+            -o table
+
+          echo ""
+          echo "========================================"
+          echo "VM Size Availability"
+          echo "========================================"
+
+          az vm list-skus \
+            --location "${{ parameters.location }}" \
+            --resource-type virtualMachines \
+            --query "[?name=='${{ parameters.vmSize }}'].name" \
+            -o table
+
+          echo ""
+          echo "========================================"
+          echo "Image Validation"
+          echo "========================================"
+
+          az vm image show \
+            --urn "$AZ_IMAGE" \
+            -o table
+
+          echo ""
+          echo "========================================"
+          echo "Creating VM..."
+          echo "========================================"
 
           az vm create \
             --resource-group "$(resourceGroupName)" \
@@ -125,41 +155,38 @@ stages:
           if [ $EXIT_CODE -ne 0 ]; then
 
             echo ""
-            echo "=================================================="
-            echo "VM creation failed."
-            echo "Collecting deployment diagnostics..."
-            echo "=================================================="
+            echo "========================================"
+            echo "VM creation failed"
+            echo "========================================"
 
             echo ""
-            echo "Deployments:"
+            echo "Deployments"
+
             az deployment group list \
               --resource-group "$(resourceGroupName)" \
-              --query "[].{Name:name,State:properties.provisioningState,Timestamp:properties.timestamp}" \
               -o table || true
 
-            DEPLOYMENT_NAME=$(az deployment group list \
+            DEPLOYMENT=$(az deployment group list \
               --resource-group "$(resourceGroupName)" \
               --query "[0].name" \
               -o tsv 2>/dev/null)
 
-            if [ -n "$DEPLOYMENT_NAME" ]; then
+            if [ ! -z "$DEPLOYMENT" ]; then
 
               echo ""
-              echo "Latest deployment:"
-              echo "$DEPLOYMENT_NAME"
+              echo "Deployment Details"
 
-              echo ""
-              echo "Deployment Details:"
               az deployment group show \
                 --resource-group "$(resourceGroupName)" \
-                --name "$DEPLOYMENT_NAME" \
+                --name "$DEPLOYMENT" \
                 -o json || true
 
               echo ""
-              echo "Deployment Operations:"
+              echo "Deployment Operations"
+
               az deployment operation group list \
                 --resource-group "$(resourceGroupName)" \
-                --name "$DEPLOYMENT_NAME" \
+                --name "$DEPLOYMENT" \
                 -o table || true
             fi
 
@@ -170,13 +197,13 @@ stages:
           echo "VM created successfully."
 
     # --------------------------------------------------------------------------
-    # Show VM Details
+    # Show VM
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: "Show VM Details"
+      displayName: Show VM Details
       condition: succeeded()
       inputs:
-        azureSubscription: "$(azureServiceConnection)"
+        azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
@@ -185,21 +212,23 @@ stages:
             --resource-group "$(resourceGroupName)" \
             --name "${{ parameters.vmName }}" \
             --show-details \
-            --output table
+            -o table
 
     # --------------------------------------------------------------------------
-    # Activity Log (runs only if deployment fails)
+    # Activity Log
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: "Show Activity Log"
+      displayName: Show Activity Log
       condition: failed()
       inputs:
-        azureSubscription: "$(azureServiceConnection)"
+        azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
 
-          echo "========== Recent Activity Log =========="
+          echo "========================================"
+          echo "Recent Activity Log"
+          echo "========================================"
 
           az monitor activity-log list \
             --resource-group "$(resourceGroupName)" \
@@ -210,11 +239,11 @@ stages:
     # Summary
     # --------------------------------------------------------------------------
     - script: |
-        echo "======================================"
+        echo "========================================"
         echo "VM Provisioning Completed Successfully"
         echo "VM Name : ${{ parameters.vmName }}"
         echo "Region  : ${{ parameters.location }}"
-        echo "Size    : ${{ parameters.vmSize }}"
+        echo "VM Size : ${{ parameters.vmSize }}"
         echo "Image   : ${{ parameters.osImage }}"
-        echo "======================================"
-      displayName: "Deployment Summary"
+        echo "========================================"
+      displayName: Deployment Summary
