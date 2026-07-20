@@ -9,19 +9,15 @@ parameters:
   - name: vmName
     type: string
     default: "dev-vm-01"
-
   - name: location
     type: string
     default: "westeurope"
-
   - name: vmSize
     type: string
     default: "Standard_B2s"
-
   - name: osImage
     type: string
     default: "ubuntu-2204"
-
   - name: adminUsername
     type: string
     default: "azureadmin"
@@ -32,218 +28,177 @@ pool:
 variables:
   azureServiceConnection: "Visual Studio Enterprise Subscription(15ec917d-2164-4d61-9fb2-243e7e5dad56)"
   resourceGroupName: "rg-backstage-vms-${{ parameters.location }}"
+  vnetName: "vnet-backstage-${{ parameters.location }}"
+  subnetName: "snet-default"
 
 stages:
-
 - stage: ProvisionVM
   displayName: Provision Virtual Machine Infrastructure
-
   jobs:
-
   - job: DeployVM
     displayName: Deploy Azure VM
-
     steps:
 
     # --------------------------------------------------------------------------
-    # Create Resource Group
+    # Step 1: Pre-flight Validations & Target Environment Setup
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: Create Resource Group
+      displayName: "Pre-flight: Prepare Network & Resource Group"
       inputs:
         azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
-
           set -euo pipefail
 
-          if az group exists --name "$(resourceGroupName)"; then
-            echo "Resource Group already exists."
-          else
-            echo "Creating Resource Group..."
-            az group create \
-              --name "$(resourceGroupName)" \
-              --location "${{ parameters.location }}"
-          fi
+          echo "Ensuring Resource Group exists..."
+          az group create --name "$(resourceGroupName)" --location "${{ parameters.location }}" -o table
+
+          echo "Ensuring baseline VNet and Subnet exist to prevent implicit creation conflicts..."
+          az network vnet create \
+            --resource-group "$(resourceGroupName)" \
+            --name "$(vnetName)" \
+            --address-prefix 10.0.0.0/16 \
+            --subnet-name "$(subnetName)" \
+            --subnet-prefix 10.0.1.0/24 \
+            -o table
 
     # --------------------------------------------------------------------------
-    # Provision VM
+    # Step 2: Dynamic OS & Credential Mapping
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: Provision Azure VM
+      displayName: "Pre-flight: Map Image URN & Credentials"
       inputs:
         azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
+          set -euo pipefail
 
-          set +e
-
+          # Map parameters to official Azure URNs
           case "${{ parameters.osImage }}" in
             ubuntu-2204)
-              AZ_IMAGE="Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest"
+              URN="Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest"
+              OS_TYPE="Linux"
               ;;
             ubuntu-2004)
-              AZ_IMAGE="Canonical:0001-com-ubuntu-server-focal:20_04-lts:latest"
+              URN="Canonical:0001-com-ubuntu-server-focal:20_04-lts:latest"
+              OS_TYPE="Linux"
               ;;
             windows-2022)
-              AZ_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
+              URN="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
+              OS_TYPE="Windows"
               ;;
             windows-2019)
-              AZ_IMAGE="MicrosoftWindowsServer:WindowsServer:2019-Datacenter:latest"
+              URN="MicrosoftWindowsServer:WindowsServer:2019-Datacenter:latest"
+              OS_TYPE="Windows"
               ;;
             *)
-              echo "Unsupported image."
+              echo "##vso[task.logissue type=error]Unsupported OS Image parameter passed from Backstage: ${{ parameters.osImage }}"
               exit 1
               ;;
           esac
 
-          echo "========================================"
-          echo "Azure Account"
-          echo "========================================"
-
-          az account show -o table
-
-          echo ""
-          echo "========================================"
-          echo "Resource Group"
-          echo "========================================"
-
-          az group show \
-            --name "$(resourceGroupName)" \
-            -o table
-
-          echo ""
-          echo "========================================"
-          echo "VM Size Availability"
-          echo "========================================"
-
-          az vm list-skus \
-            --location "${{ parameters.location }}" \
-            --resource-type virtualMachines \
-            --query "[?name=='${{ parameters.vmSize }}'].name" \
-            -o table
-
-          echo ""
-          echo "========================================"
-          echo "Image Validation"
-          echo "========================================"
-
-          az vm image show \
-            --urn "$AZ_IMAGE" \
-            -o table
-
-          echo ""
-          echo "========================================"
-          echo "Creating VM..."
-          echo "========================================"
-
-          az vm create \
-            --resource-group "$(resourceGroupName)" \
-            --name "${{ parameters.vmName }}" \
-            --image "$AZ_IMAGE" \
-            --size "${{ parameters.vmSize }}" \
-            --admin-username "${{ parameters.adminUsername }}" \
-            --generate-ssh-keys \
-            --public-ip-sku Standard \
-            --output json \
-            --debug
-
-          EXIT_CODE=$?
-
-          if [ $EXIT_CODE -ne 0 ]; then
-
-            echo ""
-            echo "========================================"
-            echo "VM creation failed"
-            echo "========================================"
-
-            echo ""
-            echo "Deployments"
-
-            az deployment group list \
-              --resource-group "$(resourceGroupName)" \
-              -o table || true
-
-            DEPLOYMENT=$(az deployment group list \
-              --resource-group "$(resourceGroupName)" \
-              --query "[0].name" \
-              -o tsv 2>/dev/null)
-
-            if [ ! -z "$DEPLOYMENT" ]; then
-
-              echo ""
-              echo "Deployment Details"
-
-              az deployment group show \
-                --resource-group "$(resourceGroupName)" \
-                --name "$DEPLOYMENT" \
-                -o json || true
-
-              echo ""
-              echo "Deployment Operations"
-
-              az deployment operation group list \
-                --resource-group "$(resourceGroupName)" \
-                --name "$DEPLOYMENT" \
-                -o table || true
-            fi
-
-            exit $EXIT_CODE
+          echo "##vso[task.setvariable variable=targetImageUrn]$URN"
+          echo "##vso[task.setvariable variable=osType]$OS_TYPE"
+          
+          # Generate a secure random password for Windows deployments
+          if [ "$OS_TYPE" = "Windows" ]; then
+            SFX=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9')
+            WIN_PASS="P@ss!${SFX:0:12}"
+            echo "##vso[task.setvariable variable=winAdminPassword;issentinel=true;issecret=true]$WIN_PASS"
+            echo "Windows password securely generated for provisioning."
           fi
 
-          echo ""
-          echo "VM created successfully."
-
     # --------------------------------------------------------------------------
-    # Show VM
+    # Step 3: Core Infrastructure Provisioning
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: Show VM Details
-      condition: succeeded()
+      displayName: "Execute: Provision Azure VM"
+      name: ProvisionStep
       inputs:
         azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
+          # Note: Dropped --debug to prevent the Python response-consumption bug.
+          # We use standard standard error forwarding if an error occurs.
+          
+          AUTH_FLAGS="--generate-ssh-keys"
+          if [ "$(osType)" = "Windows" ]; then
+            AUTH_FLAGS="--admin-password $(winAdminPassword)"
+          fi
 
-          az vm show \
+          echo "Launching deployment for ${{ parameters.vmName }} using VM Size ${{ parameters.vmSize }}..."
+          
+          az vm create \
             --resource-group "$(resourceGroupName)" \
             --name "${{ parameters.vmName }}" \
-            --show-details \
-            -o table
+            --image "$(targetImageUrn)" \
+            --size "${{ parameters.vmSize }}" \
+            --admin-username "${{ parameters.adminUsername }}" \
+            --vnet-name "$(vnetName)" \
+            --subnet "$(subnetName)" \
+            --public-ip-sku Standard \
+            $AUTH_FLAGS \
+            --output json > vm_output.json
+
+          if [ $? -ne 0 ]; then
+            echo "##vso[task.logissue type=error]Azure VM provisioning failed command execution."
+            exit 1
+          fi
+
+          # Extract IP addresses for Backstage topology ingestion
+          PUBLIC_IP=$(jq -r '.publicIpAddress' vm_output.json)
+          PRIVATE_IP=$(jq -r '.privateIpAddress' vm_output.json)
+          
+          echo "##vso[task.setvariable variable=vmPublicIp]$PUBLIC_IP"
+          echo "##vso[task.setvariable variable=vmPrivateIp]$PRIVATE_IP"
 
     # --------------------------------------------------------------------------
-    # Activity Log
+    # Step 4: Fallback Diagnostic Extraction (Executes only on failure)
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
-      displayName: Show Activity Log
+      displayName: "Diagnostics: Analyze Deployment Errors"
       condition: failed()
       inputs:
         azureSubscription: $(azureServiceConnection)
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
-
-          echo "========================================"
-          echo "Recent Activity Log"
-          echo "========================================"
-
-          az monitor activity-log list \
-            --resource-group "$(resourceGroupName)" \
-            --max-events 20 \
-            -o table || true
+          echo "================================================================="
+          echo "           FETCHING COMPONENT LEVEL DEPLOYMENT ERRORS            "
+          echo "================================================================="
+          
+          # Find the last failed deployment operation within the resource group
+          LAST_DEPLOYMENT=$(az deployment group list --resource-group "$(resourceGroupName)" --query "[?properties.provisioningState=='Failed'].name | [0]" -o tsv)
+          
+          if [ ! -z "$LAST_DEPLOYMENT" ]; then
+            echo "Analyzing failed deployment structure: $LAST_DEPLOYMENT"
+            az deployment operation group list \
+              --resource-group "$(resourceGroupName)" \
+              --name "$LAST_DEPLOYMENT" \
+              --query "[?properties.provisioningState=='Failed'].{Resource:properties.targetResource.resourceName, Type:properties.targetResource.resourceType, Code:properties.statusMessage.error.code, Message:properties.statusMessage.error.message}" \
+              -o table
+          else
+            echo "No broken template tracking deployments found. Inspecting recent Resource Group activity logs:"
+            az monitor activity-log list --resource-group "$(resourceGroupName)" --max-events 15 --status Failed -o table
+          fi
 
     # --------------------------------------------------------------------------
-    # Summary
+    # Step 5: Format Final Outputs for Backstage Consumption
     # --------------------------------------------------------------------------
     - script: |
-        echo "========================================"
-        echo "VM Provisioning Completed Successfully"
-        echo "VM Name : ${{ parameters.vmName }}"
-        echo "Region  : ${{ parameters.location }}"
-        echo "VM Size : ${{ parameters.vmSize }}"
-        echo "Image   : ${{ parameters.osImage }}"
-        echo "========================================"
-      displayName: Deployment Summary
+        echo "================================================================="
+        echo "           VM PROVISIONING COMPLETED SUCCESSFULLY                "
+        echo "================================================================="
+        echo "VM Name    : ${{ parameters.vmName }}"
+        echo "OS Platform: $(osType) (${{ parameters.osImage }})"
+        echo "Region     : ${{ parameters.location }}"
+        echo "Size Spec  : ${{ parameters.vmSize }}"
+        echo "Public IP  : $(vmPublicIp)"
+        echo "Private IP : $(vmPrivateIp)"
+        echo "================================================================="
+        echo "Backstage data registration format: ready."
+      displayName: "Summary: Emit Infrastructure Metadata"
+      condition: succeeded()
