@@ -11,7 +11,7 @@ parameters:
     default: "dev-vm-01"
   - name: location
     type: string
-    default: "westeurope"
+    default: "eastus"
   - name: vmSize
     type: string
     default: "Standard_B2s"
@@ -111,7 +111,7 @@ stages:
           fi
 
     # --------------------------------------------------------------------------
-    # Step 3: Core Infrastructure Provisioning
+    # Step 3: Core Infrastructure Provisioning (Asynchronous + Polling)
     # --------------------------------------------------------------------------
     - task: AzureCLI@2
       displayName: "Execute: Provision Azure VM"
@@ -121,16 +121,16 @@ stages:
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
-          # Note: Dropped --debug to prevent the Python response-consumption bug.
-          # We use standard standard error forwarding if an error occurs.
-          
+          set -euo pipefail
+
           AUTH_FLAGS="--generate-ssh-keys"
           if [ "$(osType)" = "Windows" ]; then
             AUTH_FLAGS="--admin-password $(winAdminPassword)"
           fi
 
-          echo "Launching deployment for ${{ parameters.vmName }} using VM Size ${{ parameters.vmSize }}..."
+          echo "Launching asynchronous deployment for ${{ parameters.vmName }} using VM Size ${{ parameters.vmSize }}..."
           
+          # 1. Use --no-wait to bypass the buggy ARM exception handler in arm.py
           az vm create \
             --resource-group "$(resourceGroupName)" \
             --name "${{ parameters.vmName }}" \
@@ -141,16 +141,22 @@ stages:
             --subnet "$(subnetName)" \
             --public-ip-sku Standard \
             $AUTH_FLAGS \
-            --output json > vm_output.json
+            --no-wait
 
-          if [ $? -ne 0 ]; then
-            echo "##vso[task.logissue type=error]Azure VM provisioning failed command execution."
-            exit 1
-          fi
+          echo "Deployment initiated. Polling compute resource until provisioning completes..."
+          
+          # 2. Poll the Compute API directly. This avoids ARM template crashes and waits cleanly.
+          az vm wait \
+            --resource-group "$(resourceGroupName)" \
+            --name "${{ parameters.vmName }}" \
+            --created \
+            --timeout 600
 
-          # Extract IP addresses for Backstage topology ingestion
-          PUBLIC_IP=$(jq -r '.publicIpAddress' vm_output.json)
-          PRIVATE_IP=$(jq -r '.privateIpAddress' vm_output.json)
+          echo "VM successfully provisioned! Fetching network properties..."
+
+          # 3. Extract IP addresses cleanly using native CLI queries
+          PUBLIC_IP=$(az vm show -d -g "$(resourceGroupName)" -n "${{ parameters.vmName }}" --query "publicIps" -o tsv)
+          PRIVATE_IP=$(az vm show -d -g "$(resourceGroupName)" -n "${{ parameters.vmName }}" --query "privateIps" -o tsv)
           
           echo "##vso[task.setvariable variable=vmPublicIp]$PUBLIC_IP"
           echo "##vso[task.setvariable variable=vmPrivateIp]$PRIVATE_IP"
@@ -170,21 +176,28 @@ stages:
           echo "           FETCHING COMPONENT LEVEL DEPLOYMENT ERRORS            "
           echo "================================================================="
           
-          # Find the last failed deployment operation within the resource group
-          LAST_DEPLOYMENT=$(az deployment group list --resource-group "$(resourceGroupName)" --query "[?properties.provisioningState=='Failed'].name | [0]" -o tsv)
+          echo "1. Checking top-level ARM deployment failures in $(resourceGroupName)..."
+          az deployment group list \
+            --resource-group "$(resourceGroupName)" \
+            --query "[?properties.provisioningState=='Failed'].{Name:name, Code:properties.error.code, Message:properties.error.message}" \
+            --output table || true
+
+          echo ""
+          echo "2. Checking detailed deployment operation failures..."
+          LAST_DEPLOYMENT=$(az deployment group list --resource-group "$(resourceGroupName)" --query "[?properties.provisioningState=='Failed'].name | [0]" -o tsv || true)
           
           if [ ! -z "$LAST_DEPLOYMENT" ]; then
-            echo "Analyzing failed deployment structure: $LAST_DEPLOYMENT"
+            echo "Inspecting failed operations for deployment: $LAST_DEPLOYMENT"
             az deployment operation group list \
               --resource-group "$(resourceGroupName)" \
               --name "$LAST_DEPLOYMENT" \
               --query "[?properties.provisioningState=='Failed'].{Resource:properties.targetResource.resourceName, Type:properties.targetResource.resourceType, Code:properties.statusMessage.error.code, Message:properties.statusMessage.error.message}" \
-              -o table
+              -o table || true
           else
-            echo "No broken template tracking deployments found. Inspecting recent Resource Group activity logs:"
-            az monitor activity-log list --resource-group "$(resourceGroupName)" --max-events 15 --status Failed -o table
+            echo "No broken deployment templates found. Checking Azure Activity Log..."
+            az monitor activity-log list --resource-group "$(resourceGroupName)" --max-events 10 --status Failed --query "[].{Operation:operationName.localizedValue, Status:status.value, Message:properties.statusMessage}" -o table || true
           fi
-
+          
     # --------------------------------------------------------------------------
     # Step 5: Format Final Outputs for Backstage Consumption
     # --------------------------------------------------------------------------
