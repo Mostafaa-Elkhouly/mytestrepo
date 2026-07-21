@@ -14,13 +14,13 @@ parameters:
     default: "eastus"
   - name: vmSize
     type: string
-    default: "Standard_B2s"
+    default: "Standard_B2s_v2"
   - name: osImage
     type: string
-    default: "ubuntu-2204"
+    default: "ubuntu-2404"
   - name: adminUsername
     type: string
-    default: "azureadmin"
+    default: "azureuser"
 
 pool:
   vmImage: ubuntu-latest
@@ -77,12 +77,12 @@ stages:
 
           # Map parameters to official Azure URNs
           case "${{ parameters.osImage }}" in
-            ubuntu-2204)
-              URN="Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest"
+            ubuntu-2404)
+              URN="Canonical:ubuntu-24_04-lts:server:latest"
               OS_TYPE="Linux"
               ;;
-            ubuntu-2004)
-              URN="Canonical:0001-com-ubuntu-server-focal:20_04-lts:latest"
+            ubuntu-2204)
+              URN="Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest"
               OS_TYPE="Linux"
               ;;
             windows-2022)
@@ -123,14 +123,14 @@ stages:
         inlineScript: |
           set -euo pipefail
 
+          # Authentication
           AUTH_FLAGS="--generate-ssh-keys"
           if [ "$(osType)" = "Windows" ]; then
             AUTH_FLAGS="--admin-password $(winAdminPassword)"
           fi
 
           echo "Launching asynchronous deployment for ${{ parameters.vmName }} using VM Size ${{ parameters.vmSize }}..."
-          
-          # 1. Use --no-wait to bypass the buggy ARM exception handler in arm.py
+
           az vm create \
             --resource-group "$(resourceGroupName)" \
             --name "${{ parameters.vmName }}" \
@@ -143,21 +143,26 @@ stages:
             $AUTH_FLAGS \
             --no-wait
 
-          echo "Deployment initiated. Polling compute resource until provisioning completes..."
-          
-          # 2. Poll the Compute API directly. This avoids ARM template crashes and waits cleanly.
+          echo "Deployment initiated. Polling until provisioning completes..."
+
           az vm wait \
             --resource-group "$(resourceGroupName)" \
             --name "${{ parameters.vmName }}" \
             --created \
             --timeout 600
 
-          echo "VM successfully provisioned! Fetching network properties..."
+          echo "VM successfully provisioned. Fetching network properties..."
 
-          # 3. Extract IP addresses cleanly using native CLI queries
-          PUBLIC_IP=$(az vm show -d -g "$(resourceGroupName)" -n "${{ parameters.vmName }}" --query "publicIps" -o tsv)
-          PRIVATE_IP=$(az vm show -d -g "$(resourceGroupName)" -n "${{ parameters.vmName }}" --query "privateIps" -o tsv)
-          
+          PUBLIC_IP=$(az vm show -d \
+            -g "$(resourceGroupName)" \
+            -n "${{ parameters.vmName }}" \
+            --query publicIps -o tsv)
+
+          PRIVATE_IP=$(az vm show -d \
+            -g "$(resourceGroupName)" \
+            -n "${{ parameters.vmName }}" \
+            --query privateIps -o tsv)
+
           echo "##vso[task.setvariable variable=vmPublicIp]$PUBLIC_IP"
           echo "##vso[task.setvariable variable=vmPrivateIp]$PRIVATE_IP"
 
